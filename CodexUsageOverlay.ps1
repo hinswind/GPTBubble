@@ -55,6 +55,17 @@ public static class CodexWindowFinder
     private static extern bool IsZoomed(IntPtr hWnd);
     [DllImport("user32.dll")]
     public static extern bool GetWindowRect(IntPtr hWnd, out RECT rect);
+    [DllImport("user32.dll", SetLastError = true)]
+    private static extern bool SetWindowPos(
+        IntPtr hWnd,
+        IntPtr hWndInsertAfter,
+        int x,
+        int y,
+        int width,
+        int height,
+        uint flags);
+    [DllImport("user32.dll")]
+    private static extern IntPtr GetWindow(IntPtr hWnd, uint command);
     [DllImport("user32.dll")]
     private static extern IntPtr MonitorFromWindow(IntPtr hWnd, uint flags);
     [DllImport("user32.dll", CharSet = CharSet.Auto)]
@@ -65,8 +76,6 @@ public static class CodexWindowFinder
         int attribute,
         out RECT value,
         int valueSize);
-    [DllImport("user32.dll")]
-    public static extern IntPtr GetForegroundWindow();
     [DllImport("user32.dll")]
     private static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint processId);
     [DllImport("user32.dll", CharSet = CharSet.Unicode)]
@@ -98,6 +107,17 @@ public static class CodexWindowFinder
                 rect = info.Work;
             }
         }
+        return true;
+    }
+
+    public static bool GetMonitorWorkArea(IntPtr hWnd, out RECT rect)
+    {
+        rect = new RECT();
+        const uint MONITOR_DEFAULTTONEAREST = 2;
+        var monitor = MonitorFromWindow(hWnd, MONITOR_DEFAULTTONEAREST);
+        var info = new MONITORINFO { Size = Marshal.SizeOf<MONITORINFO>() };
+        if (monitor == IntPtr.Zero || !GetMonitorInfo(monitor, ref info)) return false;
+        rect = info.Work;
         return true;
     }
 
@@ -135,12 +155,25 @@ public static class CodexWindowFinder
         return best;
     }
 
-    public static bool IsCodexForeground()
+    public static bool PlaceWindowAbove(IntPtr window, IntPtr codexWindow)
     {
-        var foreground = GetForegroundWindow();
-        if (foreground == IntPtr.Zero) return false;
-        GetWindowThreadProcessId(foreground, out var processId);
-        return IsCodexProcess(processId) || processId == (uint)Process.GetCurrentProcess().Id;
+        const uint GW_HWNDPREV = 3;
+        const uint SWP_NOSIZE = 0x0001;
+        const uint SWP_NOMOVE = 0x0002;
+        const uint SWP_NOACTIVATE = 0x0010;
+
+        // hWndInsertAfter 表示“排在该窗口之后（更低）”。要让浮层位于
+        // Codex 上方，需找到 Codex 当前的上一层，再插入两者之间。
+        var windowAboveCodex = GetWindow(codexWindow, GW_HWNDPREV);
+        if (windowAboveCodex == window) return true;
+        return SetWindowPos(
+            window,
+            windowAboveCodex,
+            0,
+            0,
+            0,
+            0,
+            SWP_NOSIZE | SWP_NOMOVE | SWP_NOACTIVATE);
     }
 }
 '@
@@ -149,7 +182,7 @@ public static class CodexWindowFinder
 <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         Width="224" Height="28" WindowStyle="None" Cursor="Arrow"
-        AllowsTransparency="True" Background="Transparent" Topmost="True"
+        AllowsTransparency="True" Background="Transparent" Topmost="False"
         ShowInTaskbar="False" ShowActivated="False" Focusable="True"
         ResizeMode="NoResize" Opacity="1">
   <Grid Width="224" Height="26" VerticalAlignment="Center" ClipToBounds="True">
@@ -175,6 +208,7 @@ public static class CodexWindowFinder
 
 $reader = [System.Xml.XmlNodeReader]::new($xaml)
 $window = [Windows.Markup.XamlReader]::Load($reader)
+$script:overlayHandle = [Windows.Interop.WindowInteropHelper]::new($window).EnsureHandle()
 $progressFill = $window.FindName('ProgressFill')
 $periodText = $window.FindName('PeriodText')
 $percentText = $window.FindName('PercentText')
@@ -412,10 +446,11 @@ function Update-UsageDetails([object]$data) {
 function Show-UsageDetails {
     if (-not $script:lastUsageData) {
         [Windows.MessageBox]::Show('正在读取用量，请稍后再试。', 'Codex 用量') | Out-Null
-        Start-UsageRefresh
+        Request-UsageRefresh
         return
     }
     if ($script:detailsWindow -and $script:detailsWindow.IsVisible) {
+        Update-DetailsWindowPosition
         $script:detailsWindow.Activate() | Out-Null
         return
     }
@@ -424,8 +459,8 @@ function Show-UsageDetails {
 <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         Width="440" Height="540" WindowStyle="None" AllowsTransparency="True"
-        Background="Transparent" ResizeMode="NoResize" Topmost="True"
-        WindowStartupLocation="CenterScreen" ShowInTaskbar="False">
+        Background="Transparent" ResizeMode="NoResize" Topmost="False"
+        WindowStartupLocation="Manual" ShowInTaskbar="False">
   <Border Background="#FFF8F8F8" BorderBrush="#FFE1E1E1" BorderThickness="1" CornerRadius="18">
     <Grid>
       <Grid.RowDefinitions>
@@ -437,7 +472,26 @@ function Show-UsageDetails {
                    VerticalAlignment="Center" />
         <Button x:Name="DetailsClose" Content="×" Width="32" Height="32"
                 HorizontalAlignment="Right" VerticalAlignment="Center" FontSize="20"
-                Foreground="#FF4B4F52" Background="Transparent" BorderThickness="0" Cursor="Hand" />
+                Foreground="#FF4B4F52" Background="Transparent" BorderThickness="0" Cursor="Hand">
+        <Button.Template>
+          <ControlTemplate TargetType="{x:Type Button}">
+            <Border x:Name="CloseButtonBackground" Background="{TemplateBinding Background}"
+                    CornerRadius="8" SnapsToDevicePixels="True">
+              <ContentPresenter x:Name="CloseButtonContent" HorizontalAlignment="Center"
+                                VerticalAlignment="Center" TextElement.Foreground="{TemplateBinding Foreground}" />
+            </Border>
+            <ControlTemplate.Triggers>
+              <Trigger Property="IsMouseOver" Value="True">
+                <Setter TargetName="CloseButtonBackground" Property="Background" Value="#FFE56F6A" />
+                <Setter TargetName="CloseButtonContent" Property="TextElement.Foreground" Value="#FFFFFFFF" />
+              </Trigger>
+              <Trigger Property="IsPressed" Value="True">
+                <Setter TargetName="CloseButtonBackground" Property="Background" Value="#FFD85C57" />
+              </Trigger>
+            </ControlTemplate.Triggers>
+          </ControlTemplate>
+        </Button.Template>
+      </Button>
       </Grid>
       <ScrollViewer Grid.Row="1" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled">
         <StackPanel x:Name="DetailsBody" Margin="16,4,16,16" />
@@ -460,7 +514,33 @@ function Show-UsageDetails {
     })
     $script:detailsWindow.Add_Closed({ $script:detailsWindow = $null })
     Update-UsageDetails $script:lastUsageData
+    Update-DetailsWindowPosition
     $script:detailsWindow.Show()
+}
+
+function Update-DetailsWindowPosition {
+    if (-not $script:detailsWindow) { return }
+
+    $overlayWidth = if ($window.ActualWidth -gt 0) { $window.ActualWidth } else { $window.Width }
+    $overlayHeight = if ($window.ActualHeight -gt 0) { $window.ActualHeight } else { $window.Height }
+    $detailWidth = $script:detailsWindow.Width
+    $detailHeight = $script:detailsWindow.Height
+    $targetLeft = $window.Left + (($overlayWidth - $detailWidth) / 2)
+    $targetTop = $window.Top + $overlayHeight + 8
+
+    $workArea = [CodexWindowFinder+RECT]::new()
+    if ([CodexWindowFinder]::GetMonitorWorkArea($script:overlayHandle, [ref]$workArea)) {
+        $dpi = [Windows.Media.VisualTreeHelper]::GetDpi($window)
+        $workLeft = $workArea.Left / $dpi.DpiScaleX
+        $workTop = $workArea.Top / $dpi.DpiScaleY
+        $workRight = $workArea.Right / $dpi.DpiScaleX
+        $workBottom = $workArea.Bottom / $dpi.DpiScaleY
+        $targetLeft = [Math]::Max($workLeft, [Math]::Min($targetLeft, $workRight - $detailWidth))
+        $targetTop = [Math]::Max($workTop, [Math]::Min($targetTop, $workBottom - $detailHeight))
+    }
+
+    $script:detailsWindow.Left = $targetLeft
+    $script:detailsWindow.Top = $targetTop
 }
 
 function Show-Usage([object]$data) {
@@ -590,7 +670,7 @@ $script:lastOverlayTop = [double]::NaN
 function Update-OverlayVisibility {
     $positionChanged = $false
     $codexWindow = [CodexWindowFinder]::FindLargestVisibleWindow()
-    $shouldShow = $codexWindow -ne [IntPtr]::Zero -and [CodexWindowFinder]::IsCodexForeground()
+    $shouldShow = $codexWindow -ne [IntPtr]::Zero
     if ($shouldShow) {
         $rect = [CodexWindowFinder+RECT]::new()
         if ([CodexWindowFinder]::GetVisibleWindowRect($codexWindow, [ref]$rect)) {
@@ -613,6 +693,11 @@ function Update-OverlayVisibility {
             $window.Show()
             $positionChanged = $true
         }
+        if ($positionChanged -and $script:detailsWindow -and $script:detailsWindow.IsVisible) {
+            Update-DetailsWindowPosition
+        }
+        # 非置顶窗口始终紧邻 Codex 上方；其他应用进入前台后会自然覆盖两者。
+        [CodexWindowFinder]::PlaceWindowAbove($script:overlayHandle, $codexWindow) | Out-Null
     }
     elseif ($window.IsVisible) {
         $window.Hide()
