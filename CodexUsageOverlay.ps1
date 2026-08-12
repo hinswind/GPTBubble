@@ -1,6 +1,7 @@
 [CmdletBinding()]
 param(
-    [int]$RefreshSeconds = 60
+    [int]$RefreshSeconds = 60,
+    [string]$StopMarkerPath
 )
 
 Set-StrictMode -Version Latest
@@ -202,6 +203,10 @@ public static class CodexWindowFinder
     <TextBlock x:Name="PercentText" Text="--" Foreground="#FF4F5357" FontSize="11.5"
                FontWeight="SemiBold" HorizontalAlignment="Right" VerticalAlignment="Center"
                Margin="0,0,12,0" />
+    <Ellipse x:Name="ResetExpiryDot" Width="7" Height="7" Fill="#FF62C887"
+             Stroke="#FFF8F8F8" StrokeThickness="1" HorizontalAlignment="Right"
+             VerticalAlignment="Top" Margin="0,3,5,0" Visibility="Collapsed"
+             Panel.ZIndex="3" />
   </Grid>
 </Window>
 '@
@@ -212,6 +217,7 @@ $script:overlayHandle = [Windows.Interop.WindowInteropHelper]::new($window).Ensu
 $progressFill = $window.FindName('ProgressFill')
 $periodText = $window.FindName('PeriodText')
 $percentText = $window.FindName('PercentText')
+$resetExpiryDot = $window.FindName('ResetExpiryDot')
 
 $resetToolTip = [Windows.Controls.ToolTip]::new()
 $resetToolTip.Placement = 'Bottom'
@@ -264,6 +270,46 @@ function Format-ResetTime([long]$unixSeconds) {
     if ($remaining.TotalDays -ge 1) { return ('{0}天{1}小时后' -f [Math]::Floor($remaining.TotalDays), $remaining.Hours) }
     if ($remaining.TotalHours -ge 1) { return ('{0}小时{1}分后' -f [Math]::Floor($remaining.TotalHours), $remaining.Minutes) }
     return ('{0}分钟后' -f [Math]::Max(1, [Math]::Ceiling($remaining.TotalMinutes)))
+}
+
+function Get-ExpiringResetCredit([object]$data) {
+    if (-not $data) { return $null }
+    $resetProperty = $data.PSObject.Properties['rateLimitResetCredits']
+    if (-not $resetProperty -or -not $resetProperty.Value) { return $null }
+
+    $resetData = $resetProperty.Value
+    $countProperty = $resetData.PSObject.Properties['availableCount']
+    if (-not $countProperty -or [int]$countProperty.Value -le 0) { return $null }
+    $creditsProperty = $resetData.PSObject.Properties['credits']
+    if (-not $creditsProperty -or -not $creditsProperty.Value) { return $null }
+
+    $nowUnix = [DateTimeOffset]::Now.ToUnixTimeSeconds()
+    $warningSeconds = 48 * 60 * 60
+    $expiringCredits = foreach ($credit in @($creditsProperty.Value)) {
+        $statusProperty = $credit.PSObject.Properties['status']
+        if ($statusProperty -and [string]$statusProperty.Value -ne 'available') { continue }
+        $expiryProperty = $credit.PSObject.Properties['expiresAt']
+        if (-not $expiryProperty -or -not $expiryProperty.Value) { continue }
+        $expiresAt = [long]$expiryProperty.Value
+        $secondsRemaining = $expiresAt - $nowUnix
+        if ($secondsRemaining -gt 0 -and $secondsRemaining -le $warningSeconds) {
+            $credit
+        }
+    }
+    return $expiringCredits | Sort-Object -Property expiresAt | Select-Object -First 1
+}
+
+function Update-ResetExpiryReminder([object]$data) {
+    $expiringCredit = Get-ExpiringResetCredit $data
+    if ($expiringCredit) {
+        $expiry = [DateTimeOffset]::FromUnixTimeSeconds([long]$expiringCredit.expiresAt).ToLocalTime()
+        $resetExpiryDot.ToolTip = '有可用重置次数将于 {0} 到期' -f $expiry.ToString('M月d日 HH:mm')
+        $resetExpiryDot.Visibility = [Windows.Visibility]::Visible
+    }
+    else {
+        $resetExpiryDot.ToolTip = $null
+        $resetExpiryDot.Visibility = [Windows.Visibility]::Collapsed
+    }
 }
 
 function Get-UiBrush([string]$color) {
@@ -592,6 +638,7 @@ function Show-Usage([object]$data) {
         "$resetLabel 重置 · $($resetAt.ToString('M月d日 HH:mm'))"
     }
     else { '重置时间未知' }
+    Update-ResetExpiryReminder $data
     $script:hasData = $true
     if ($script:detailsWindow -and $script:detailsWindow.IsVisible) {
         Update-UsageDetails $data
@@ -795,7 +842,11 @@ $usagePageItem = $contextMenu.FindName('UsageDetailsItem')
 $exitItem = $contextMenu.FindName('ExitItem')
 $refreshItem.Add_Click({ Request-UsageRefresh })
 $usagePageItem.Add_Click({ Show-UsageDetails })
-$exitItem.Add_Click({ $window.Close() })
+$script:userRequestedExit = $false
+$exitItem.Add_Click({
+    $script:userRequestedExit = $true
+    $window.Close()
+})
 $window.ContextMenu = $contextMenu
 $window.Add_MouseDoubleClick({
     param($sender, $eventArgs)
@@ -845,6 +896,18 @@ $window.Add_Closed({
     }
     try { $script:singleInstanceMutex.ReleaseMutex() } catch {}
     $script:singleInstanceMutex.Dispose()
+    if ($script:userRequestedExit -and $StopMarkerPath) {
+        try {
+            $markerDirectory = Split-Path -Parent $StopMarkerPath
+            if (-not (Test-Path -LiteralPath $markerDirectory)) {
+                New-Item -ItemType Directory -Path $markerDirectory -Force | Out-Null
+            }
+            $bootTime = (Get-CimInstance Win32_OperatingSystem).LastBootUpTime.ToUniversalTime().Ticks
+            $sessionKey = '{0}|{1}' -f ([Diagnostics.Process]::GetCurrentProcess().SessionId), $bootTime
+            Set-Content -LiteralPath $StopMarkerPath -Value $sessionKey -Encoding UTF8
+        }
+        catch { }
+    }
 })
 
 Start-UsageWatcher
