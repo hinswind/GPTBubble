@@ -10,6 +10,17 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
+$runnerCreatedNew = $false
+$script:runnerMutex = [Threading.Mutex]::new(
+    $true,
+    'Local\GPTBubbleRunner',
+    [ref]$runnerCreatedNew
+)
+if (-not $runnerCreatedNew) {
+    $script:runnerMutex.Dispose()
+    exit 0
+}
+
 if (-not $OverlayScriptPath) {
     $OverlayScriptPath = Join-Path $PSScriptRoot 'CodexUsageOverlay.ps1'
 }

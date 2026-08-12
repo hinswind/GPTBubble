@@ -10,7 +10,7 @@
 2. 双击 `start-overlay.cmd`。
 3. 状态条会跟随 Codex 窗口并始终在顶部栏水平、垂直居中；右键可立即刷新、打开只读用量详情或退出。
 
-运行 `Install-Startup.ps1` 可注册为 Windows 登录后静默启动。计划任务每分钟执行一次健康检查，因此即使进程被外部强制终止也能恢复；从右键菜单正常退出则保持关闭到下次登录或手动启动。运行日志保存在 `%LOCALAPPDATA%\GPTBubble\GPTBubble.log`。浮层使用单实例保护，重复启动不会产生多个状态条。
+运行 `Install-Startup.ps1` 可注册为 Windows 登录后无终端静默启动。计划任务每分钟执行一次健康检查，因此即使进程被外部强制终止也能恢复；从右键菜单正常退出则保持关闭到下次登录或手动启动。运行日志保存在 `%LOCALAPPDATA%\GPTBubble\GPTBubble.log`。浮层使用单实例保护，重复启动不会产生多个状态条。
 
 状态条保持一个后台 `codex app-server` 连接，收到 `account/rateLimits/updated` 后立即更新，并每 60 秒兜底刷新。默认只显示 Codex 主额度，不显示 Spark，也不使用透明度变化。它会跟随 Codex 窗口移动和尺寸变化，始终在顶部栏水平、垂直居中，并处于 Codex 正上方一层；切换应用时由其他窗口自然覆盖，最小化或关闭 Codex 时自动隐藏。它不会修改 Codex 安装文件，也不会读取或保存登录令牌；数据来自官方 `account/rateLimits/read`。
 

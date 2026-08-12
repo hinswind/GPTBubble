@@ -8,7 +8,9 @@ $ErrorActionPreference = 'Stop'
 
 $projectDirectory = Split-Path -Parent $PSCommandPath
 $runnerScript = Join-Path $projectDirectory 'Run-GPTBubble.ps1'
+$launcherScript = Join-Path $projectDirectory 'Launch-GPTBubble.vbs'
 $pwshPath = 'C:\Program Files\PowerShell\7\pwsh.exe'
+$wscriptPath = Join-Path $env:SystemRoot 'System32\wscript.exe'
 $taskName = 'GPTBubble'
 $startupDirectory = [Environment]::GetFolderPath('Startup')
 $legacyShortcutPath = Join-Path $startupDirectory 'Codex Usage Overlay.lnk'
@@ -32,11 +34,17 @@ if (-not (Test-Path -LiteralPath $pwshPath)) {
 if (-not (Test-Path -LiteralPath $runnerScript)) {
     throw "未找到启动器：$runnerScript"
 }
+if (-not (Test-Path -LiteralPath $launcherScript)) {
+    throw "未找到无窗口启动器：$launcherScript"
+}
+if (-not (Test-Path -LiteralPath $wscriptPath)) {
+    throw "未找到 Windows Script Host：$wscriptPath"
+}
 
 $currentUser = [Security.Principal.WindowsIdentity]::GetCurrent().Name
-$arguments = '-NoLogo -NoProfile -ExecutionPolicy Bypass -STA -WindowStyle Hidden -File "{0}"' -f $runnerScript
+$arguments = '"{0}"' -f $launcherScript
 $action = New-ScheduledTaskAction `
-    -Execute $pwshPath `
+    -Execute $wscriptPath `
     -Argument $arguments `
     -WorkingDirectory $projectDirectory
 $trigger = New-ScheduledTaskTrigger -AtLogOn -User $currentUser
@@ -63,6 +71,19 @@ $task = New-ScheduledTask `
     -Settings $settings `
     -Description 'Codex 用量浮层；异常退出后自动重启，正常退出后保持关闭。'
 
+$existingTask = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
+if ($existingTask -and $existingTask.State -eq 'Running') {
+    Stop-ScheduledTask -TaskName $taskName
+    $stopDeadline = [DateTime]::UtcNow.AddSeconds(5)
+    do {
+        Start-Sleep -Milliseconds 100
+        $existingTask = Get-ScheduledTask -TaskName $taskName
+    } while ($existingTask.State -eq 'Running' -and [DateTime]::UtcNow -lt $stopDeadline)
+    if ($existingTask.State -eq 'Running') {
+        throw '旧版 GPTBubble 任务未能在 5 秒内停止。'
+    }
+}
+
 Register-ScheduledTask -TaskName $taskName -InputObject $task -Force | Out-Null
 
 # Remove the old one-shot startup entry only after the resilient task is registered.
@@ -86,5 +107,6 @@ $registeredTask = Get-ScheduledTask -TaskName $taskName
     RestartCount = $registeredTask.Settings.RestartCount
     RestartInterval = $registeredTask.Settings.RestartInterval
     HealthCheckInterval = 'PT1M'
+    Launcher = $wscriptPath
     LogPath = Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'GPTBubble\GPTBubble.log'
 }
