@@ -84,6 +84,26 @@ if ($existingTask -and $existingTask.State -eq 'Running') {
     }
 }
 
+# A previous launcher can outlive Task Scheduler's running state. Stop only
+# processes whose command line points at this project's runner/overlay.
+$managedScriptPaths = @(
+    $runnerScript,
+    (Join-Path $projectDirectory 'CodexUsageOverlay.ps1')
+)
+$managedProcesses = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object {
+    $commandLine = $_.CommandLine
+    if (-not $commandLine) { return $false }
+    foreach ($managedPath in $managedScriptPaths) {
+        if ($commandLine.Contains($managedPath, [StringComparison]::OrdinalIgnoreCase)) {
+            return $true
+        }
+    }
+    return $false
+})
+foreach ($managedProcess in $managedProcesses) {
+    Stop-Process -Id $managedProcess.ProcessId -Force -ErrorAction Stop
+}
+
 Register-ScheduledTask -TaskName $taskName -InputObject $task -Force | Out-Null
 
 # Remove the old one-shot startup entry only after the resilient task is registered.

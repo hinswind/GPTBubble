@@ -202,11 +202,15 @@ public static class CodexWindowFinder
                Margin="12,0,0,0" />
     <TextBlock x:Name="PercentText" Text="--" Foreground="#FF4F5357" FontSize="11.5"
                FontWeight="SemiBold" HorizontalAlignment="Right" VerticalAlignment="Center"
-               Margin="0,0,12,0" />
-    <Ellipse x:Name="ResetExpiryDot" Width="7" Height="7" Fill="#FF62C887"
-             Stroke="#FFF8F8F8" StrokeThickness="1" HorizontalAlignment="Right"
-             VerticalAlignment="Top" Margin="0,3,5,0" Visibility="Collapsed"
-             Panel.ZIndex="3" />
+               Margin="0,0,25,0" />
+    <Border x:Name="ResetCreditBadge" MinWidth="15" Height="15" Padding="4,0"
+            Background="#FF62C887" BorderBrush="#FFF8F8F8" BorderThickness="1"
+            CornerRadius="8" HorizontalAlignment="Right" VerticalAlignment="Top"
+            Margin="0,1,2,0" Visibility="Collapsed" Panel.ZIndex="3">
+      <TextBlock x:Name="ResetCreditCountText" Text="0" Foreground="#FFFFFFFF"
+                 FontSize="9" FontWeight="SemiBold" TextAlignment="Center"
+                 HorizontalAlignment="Center" VerticalAlignment="Center" />
+    </Border>
   </Grid>
 </Window>
 '@
@@ -217,7 +221,8 @@ $script:overlayHandle = [Windows.Interop.WindowInteropHelper]::new($window).Ensu
 $progressFill = $window.FindName('ProgressFill')
 $periodText = $window.FindName('PeriodText')
 $percentText = $window.FindName('PercentText')
-$resetExpiryDot = $window.FindName('ResetExpiryDot')
+$resetCreditBadge = $window.FindName('ResetCreditBadge')
+$resetCreditCountText = $window.FindName('ResetCreditCountText')
 
 $resetToolTip = [Windows.Controls.ToolTip]::new()
 $resetToolTip.Placement = 'Bottom'
@@ -246,6 +251,34 @@ $resetToolTip.Add_Opened({
 })
 [Windows.Controls.ToolTipService]::SetInitialShowDelay($window, 180)
 [Windows.Controls.ToolTipService]::SetShowDuration($window, 12000)
+
+$resetCreditToolTip = [Windows.Controls.ToolTip]::new()
+$resetCreditToolTip.Placement = 'Bottom'
+$resetCreditToolTip.PlacementTarget = $resetCreditBadge
+$resetCreditToolTip.VerticalOffset = 5
+$resetCreditToolTip.Background = [Windows.Media.Brushes]::Transparent
+$resetCreditToolTip.BorderThickness = [Windows.Thickness]::new(0)
+$resetCreditToolTip.Padding = [Windows.Thickness]::new(0)
+$resetCreditToolTip.HasDropShadow = $false
+$resetCreditTipBorder = [Windows.Controls.Border]::new()
+$resetCreditTipBorder.Background = [Windows.Media.BrushConverter]::new().ConvertFromString('#FAF7F7F7')
+$resetCreditTipBorder.BorderBrush = [Windows.Media.BrushConverter]::new().ConvertFromString('#FFE1E1E1')
+$resetCreditTipBorder.BorderThickness = [Windows.Thickness]::new(1)
+$resetCreditTipBorder.CornerRadius = [Windows.CornerRadius]::new(8)
+$resetCreditTipBorder.Padding = [Windows.Thickness]::new(10, 6, 10, 6)
+$resetCreditToolTipText = [Windows.Controls.TextBlock]::new()
+$resetCreditToolTipText.FontSize = 11
+$resetCreditToolTipText.Foreground = [Windows.Media.BrushConverter]::new().ConvertFromString('#FF202124')
+$resetCreditTipBorder.Child = $resetCreditToolTipText
+$resetCreditToolTip.Content = $resetCreditTipBorder
+$resetCreditBadge.ToolTip = $resetCreditToolTip
+$resetCreditToolTip.Add_Opened({
+    $resetCreditTipBorder.Measure([Windows.Size]::new([double]::PositiveInfinity, [double]::PositiveInfinity))
+    $resetCreditToolTip.HorizontalOffset = `
+        ($resetCreditBadge.ActualWidth - $resetCreditTipBorder.DesiredSize.Width) / 2
+})
+[Windows.Controls.ToolTipService]::SetInitialShowDelay($resetCreditBadge, 180)
+[Windows.Controls.ToolTipService]::SetShowDuration($resetCreditBadge, 12000)
 $watcherScript = Join-Path $PSScriptRoot 'Watch-CodexUsage.ps1'
 $script:usageCommands = [System.Collections.Concurrent.ConcurrentQueue[string]]::new()
 $script:usageJob = $null
@@ -272,44 +305,53 @@ function Format-ResetTime([long]$unixSeconds) {
     return ('{0}分钟后' -f [Math]::Max(1, [Math]::Ceiling($remaining.TotalMinutes)))
 }
 
-function Get-ExpiringResetCredit([object]$data) {
-    if (-not $data) { return $null }
-    $resetProperty = $data.PSObject.Properties['rateLimitResetCredits']
-    if (-not $resetProperty -or -not $resetProperty.Value) { return $null }
+function Update-ResetCreditBadge([object]$data) {
+    $resetProperty = if ($data) { $data.PSObject.Properties['rateLimitResetCredits'] } else { $null }
+    $resetData = if ($resetProperty) { $resetProperty.Value } else { $null }
+    $countProperty = if ($resetData) { $resetData.PSObject.Properties['availableCount'] } else { $null }
+    $availableCount = if ($countProperty) { [Math]::Max(0, [int]$countProperty.Value) } else { 0 }
 
-    $resetData = $resetProperty.Value
-    $countProperty = $resetData.PSObject.Properties['availableCount']
-    if (-not $countProperty -or [int]$countProperty.Value -le 0) { return $null }
-    $creditsProperty = $resetData.PSObject.Properties['credits']
-    if (-not $creditsProperty -or -not $creditsProperty.Value) { return $null }
-
-    $nowUnix = [DateTimeOffset]::Now.ToUnixTimeSeconds()
-    $warningSeconds = 48 * 60 * 60
-    $expiringCredits = foreach ($credit in @($creditsProperty.Value)) {
-        $statusProperty = $credit.PSObject.Properties['status']
-        if ($statusProperty -and [string]$statusProperty.Value -ne 'available') { continue }
-        $expiryProperty = $credit.PSObject.Properties['expiresAt']
-        if (-not $expiryProperty -or -not $expiryProperty.Value) { continue }
-        $expiresAt = [long]$expiryProperty.Value
-        $secondsRemaining = $expiresAt - $nowUnix
-        if ($secondsRemaining -gt 0 -and $secondsRemaining -le $warningSeconds) {
-            $credit
-        }
+    if ($availableCount -le 0) {
+        $resetCreditBadge.Visibility = [Windows.Visibility]::Collapsed
+        return
     }
-    return $expiringCredits | Sort-Object -Property expiresAt | Select-Object -First 1
-}
 
-function Update-ResetExpiryReminder([object]$data) {
-    $expiringCredit = Get-ExpiringResetCredit $data
-    if ($expiringCredit) {
-        $expiry = [DateTimeOffset]::FromUnixTimeSeconds([long]$expiringCredit.expiresAt).ToLocalTime()
-        $resetExpiryDot.ToolTip = '有可用重置次数将于 {0} 到期' -f $expiry.ToString('M月d日 HH:mm')
-        $resetExpiryDot.Visibility = [Windows.Visibility]::Visible
+    $resetCreditCountText.Text = [string]$availableCount
+    $creditsProperty = $resetData.PSObject.Properties['credits']
+    $nowUnix = [DateTimeOffset]::Now.ToUnixTimeSeconds()
+    $earliestCredit = if ($creditsProperty -and $creditsProperty.Value) {
+        @($creditsProperty.Value) |
+            Where-Object {
+                $statusProperty = $_.PSObject.Properties['status']
+                $expiryProperty = $_.PSObject.Properties['expiresAt']
+                (-not $statusProperty -or [string]$statusProperty.Value -eq 'available') -and
+                    $expiryProperty -and [long]$expiryProperty.Value -gt $nowUnix
+            } |
+            Sort-Object -Property expiresAt |
+            Select-Object -First 1
+    }
+
+    if ($earliestCredit) {
+        $expiryUnix = [long]$earliestCredit.expiresAt
+        $expiry = [DateTimeOffset]::FromUnixTimeSeconds($expiryUnix).ToLocalTime()
+        $secondsRemaining = $expiryUnix - $nowUnix
+        $resetCreditBadge.Background = if ($secondsRemaining -le 24 * 60 * 60) {
+            Get-UiBrush '#FFE47D76'
+        }
+        elseif ($secondsRemaining -le 3 * 24 * 60 * 60) {
+            Get-UiBrush '#FFF0A84F'
+        }
+        else {
+            Get-UiBrush '#FF6FC68A'
+        }
+        $resetCreditToolTipText.Text = '可用重置次数 {0} · 最早于 {1} 到期' -f `
+            $availableCount, $expiry.ToString('M月d日 HH:mm')
     }
     else {
-        $resetExpiryDot.ToolTip = $null
-        $resetExpiryDot.Visibility = [Windows.Visibility]::Collapsed
+        $resetCreditBadge.Background = Get-UiBrush '#FFA7ADB3'
+        $resetCreditToolTipText.Text = '可用重置次数 {0} · 到期时间未知' -f $availableCount
     }
+    $resetCreditBadge.Visibility = [Windows.Visibility]::Visible
 }
 
 function Get-UiBrush([string]$color) {
@@ -638,7 +680,7 @@ function Show-Usage([object]$data) {
         "$resetLabel 重置 · $($resetAt.ToString('M月d日 HH:mm'))"
     }
     else { '重置时间未知' }
-    Update-ResetExpiryReminder $data
+    Update-ResetCreditBadge $data
     $script:hasData = $true
     if ($script:detailsWindow -and $script:detailsWindow.IsVisible) {
         Update-UsageDetails $data
