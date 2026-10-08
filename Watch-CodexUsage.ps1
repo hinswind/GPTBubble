@@ -1,6 +1,7 @@
 [CmdletBinding()]
 param(
     [int]$FallbackSeconds = 60,
+    [ValidateRange(1, 120)][int]$RequestTimeoutSeconds = 20,
     [System.Collections.Concurrent.ConcurrentQueue[string]]$CommandQueue
 )
 
@@ -97,6 +98,7 @@ while (-not $stopRequested) {
         $state = @{
             NextId       = 2
             PendingId    = $null
+            PendingSince = [DateTime]::MinValue
             NextFallback = [DateTime]::UtcNow
         }
         $readTask = $null
@@ -115,10 +117,16 @@ while (-not $stopRequested) {
             }
             if ($stopRequested) { break }
 
+            if ($null -ne $state.PendingId -and
+                ([DateTime]::UtcNow - $state.PendingSince).TotalSeconds -ge $RequestTimeoutSeconds) {
+                throw "用量请求超过 $RequestTimeoutSeconds 秒未响应，正在重新连接。"
+            }
+
             if ($null -eq $state.PendingId -and [DateTime]::UtcNow -ge $state.NextFallback) {
                 $requestId = [int]$state.NextId
                 $state.NextId = $requestId + 1
                 $state.PendingId = $requestId
+                $state.PendingSince = [DateTime]::UtcNow
                 $state.NextFallback = [DateTime]::UtcNow.AddSeconds($FallbackSeconds)
                 & $sendMessage @{ method = 'account/rateLimits/read'; id = $requestId }
             }
@@ -164,6 +172,9 @@ while (-not $stopRequested) {
                         "读取剩余用量失败：$($response.error | ConvertTo-Json -Depth 8 -Compress)"
                     }
                     Write-WatcherEvent 'error' $null $errorMessage
+                    # A request-level error does not close the app-server connection.
+                    # Retry quickly instead of leaving the UI stale until the 60s fallback.
+                    $state.NextFallback = [DateTime]::UtcNow.AddSeconds(3)
                     continue
                 }
 

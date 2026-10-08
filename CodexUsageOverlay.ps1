@@ -1,6 +1,7 @@
 [CmdletBinding()]
 param(
     [int]$RefreshSeconds = 60,
+    [ValidateRange(28, 100)][double]$TitleBarHeight = 44,
     [string]$StopMarkerPath
 )
 
@@ -305,7 +306,28 @@ function Format-ResetTime([long]$unixSeconds) {
     return ('{0}分钟后' -f [Math]::Max(1, [Math]::Ceiling($remaining.TotalMinutes)))
 }
 
-function Update-ResetCreditBadge([object]$data) {
+$script:lastBadgeState = ''
+function Write-ResetBadgeState([int]$count, [long]$expiry, [string]$color) {
+    $state = "$count|$expiry|$color"
+    if ($state -eq $script:lastBadgeState) { return }
+    try {
+        $directory = Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'GPTBubble'
+        $path = Join-Path $directory 'reset-badge.log'
+        [IO.Directory]::CreateDirectory($directory) | Out-Null
+        if ((Test-Path -LiteralPath $path) -and (Get-Item -LiteralPath $path).Length -ge 1MB) {
+            Move-Item -LiteralPath $path -Destination "$path.previous" -Force
+        }
+        $expiryText = if ($expiry -gt 0) {
+            [DateTimeOffset]::FromUnixTimeSeconds($expiry).ToLocalTime().ToString('yyyy-MM-dd HH:mm:ss zzz')
+        } else { 'unknown' }
+        Add-Content -LiteralPath $path -Encoding UTF8 -Value (
+            '{0} count={1} earliest={2} color={3}' -f [DateTimeOffset]::Now.ToString('o'), $count, $expiryText, $color)
+        $script:lastBadgeState = $state
+    }
+    catch { } # 日志失败不能影响提醒。
+}
+
+function Update-ResetCreditBadge([object]$data, [long]$nowUnix = [DateTimeOffset]::Now.ToUnixTimeSeconds()) {
     $resetProperty = if ($data) { $data.PSObject.Properties['rateLimitResetCredits'] } else { $null }
     $resetData = if ($resetProperty) { $resetProperty.Value } else { $null }
     $countProperty = if ($resetData) { $resetData.PSObject.Properties['availableCount'] } else { $null }
@@ -313,12 +335,12 @@ function Update-ResetCreditBadge([object]$data) {
 
     if ($availableCount -le 0) {
         $resetCreditBadge.Visibility = [Windows.Visibility]::Collapsed
+        Write-ResetBadgeState 0 0 'hidden'
         return
     }
 
     $resetCreditCountText.Text = [string]$availableCount
     $creditsProperty = $resetData.PSObject.Properties['credits']
-    $nowUnix = [DateTimeOffset]::Now.ToUnixTimeSeconds()
     $earliestCredit = if ($creditsProperty -and $creditsProperty.Value) {
         @($creditsProperty.Value) |
             Where-Object {
@@ -352,6 +374,8 @@ function Update-ResetCreditBadge([object]$data) {
         $resetCreditToolTipText.Text = '可用重置次数 {0} · 到期时间未知' -f $availableCount
     }
     $resetCreditBadge.Visibility = [Windows.Visibility]::Visible
+    $loggedExpiry = if ($earliestCredit) { [long]$earliestCredit.expiresAt } else { 0 }
+    Write-ResetBadgeState $availableCount $loggedExpiry $resetCreditBadge.Background.ToString()
 }
 
 function Get-UiBrush([string]$color) {
@@ -477,7 +501,8 @@ function Add-ResetCreditsCard([Windows.Controls.Panel]$parent, [object]$resetDat
             $row.ColumnDefinitions.Add([Windows.Controls.ColumnDefinition]@{ Width = [Windows.GridLength]::new(1, [Windows.GridUnitType]::Star) })
             $row.ColumnDefinitions.Add([Windows.Controls.ColumnDefinition]@{ Width = [Windows.GridLength]::Auto })
             $textStack = [Windows.Controls.StackPanel]::new()
-            $creditTitle = if ($credit.title) { [string]$credit.title } else { 'Full reset' }
+            $creditTitle = if ($credit.title) { [string]$credit.title } else { '完全重置' }
+            if ($creditTitle.Trim() -ieq 'Full reset') { $creditTitle = '完全重置' }
             $textStack.Children.Add((New-DetailText $creditTitle 12 '#FF202124' 'SemiBold')) | Out-Null
             $expiryText = if ($credit.expiresAt) {
                 $expiry = [DateTimeOffset]::FromUnixTimeSeconds([long]$credit.expiresAt).ToLocalTime()
@@ -598,6 +623,11 @@ function Show-UsageDetails {
         param($sender, $mouseEvent)
         if ($mouseEvent.LeftButton -eq [Windows.Input.MouseButtonState]::Pressed) {
             try { $script:detailsWindow.DragMove() } catch { }
+        }
+    })
+    $script:detailsWindow.Add_Deactivated({
+        if ($script:detailsWindow -and $script:detailsWindow.IsVisible) {
+            $script:detailsWindow.Close()
         }
     })
     $script:detailsWindow.Add_Closed({ $script:detailsWindow = $null })
@@ -731,10 +761,7 @@ function Receive-UsageEvents {
             elseif ($usageEvent.kind -eq 'error') {
                 $message = [string]$usageEvent.message
                 if ($message.Length -gt 180) { $message = $message.Substring(0, 177) + '…' }
-                if ($script:hasData) {
-                    $resetToolTipText.Text = "$message · 正在自动重连"
-                }
-                else {
+                if (-not $script:hasData) {
                     Show-UsageError $message
                 }
             }
@@ -764,8 +791,8 @@ function Update-OverlayVisibility {
         $rect = [CodexWindowFinder+RECT]::new()
         if ([CodexWindowFinder]::GetVisibleWindowRect($codexWindow, [ref]$rect)) {
             $dpi = [Windows.Media.VisualTreeHelper]::GetDpi($window)
-            # Codex 原生顶部栏高度为 36 DIP；状态条按自身高度做水平、垂直几何居中。
-            $titleBarHeight = 36
+            # 新版 Windows 顶部区域包含 36 DIP 菜单和 8 DIP 下方留白。
+            # 按整个区域居中；TitleBarHeight 可适配不同版本的布局。
             $targetLeft = (($rect.Left + $rect.Right) / 2 / $dpi.DpiScaleX) - ($window.Width / 2)
             $targetTop = ($rect.Top / $dpi.DpiScaleY) + (($titleBarHeight - $window.Height) / 2)
             if ([double]::IsNaN($script:lastOverlayLeft) -or
@@ -900,8 +927,20 @@ $window.Add_MouseDoubleClick({
 
 $usageTimer = [Windows.Threading.DispatcherTimer]::new()
 $usageTimer.Interval = [TimeSpan]::FromMilliseconds(400)
+$script:lastClockTick = [DateTime]::UtcNow
+$script:nextBadgeRefresh = [DateTime]::UtcNow
 $usageTimer.Add_Tick({
     Receive-UsageEvents
+    $clockNow = [DateTime]::UtcNow
+    # 休眠恢复或系统时钟跳变后，下一次 UI tick 立即重算并补读。
+    $clockGap = ($clockNow - $script:lastClockTick).TotalSeconds
+    $clockResumed = $clockGap -gt 5 -or $clockGap -lt 0
+    if ($clockResumed -or $clockNow -ge $script:nextBadgeRefresh) {
+        if ($script:lastUsageData) { Update-ResetCreditBadge $script:lastUsageData }
+        $script:nextBadgeRefresh = $clockNow.AddSeconds(30)
+        if ($clockResumed) { Request-UsageRefresh }
+    }
+    $script:lastClockTick = $clockNow
 })
 
 $positionIdleInterval = [TimeSpan]::FromMilliseconds(120)
