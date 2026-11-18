@@ -702,8 +702,23 @@ function Show-Usage([object]$data) {
 
     $periodLabel = Format-WindowLabel ([int]$limitWindow.windowDurationMins) 0
     $resetLabel = Format-ResetTime ([long]$limitWindow.resetsAt)
-    $periodText.Text = $periodLabel
-    $percentText.Text = ('{0:0}%' -f $remainingPercent)
+    $balance = 0D
+    $creditsProperty = $codexBucket.PSObject.Properties['credits']
+    $balanceProperty = if ($creditsProperty -and $creditsProperty.Value) {
+        $creditsProperty.Value.PSObject.Properties['balance']
+    } else { $null }
+    $showBalance = $remainingPercent -le 0 -and $balanceProperty -and
+        [decimal]::TryParse([string]$balanceProperty.Value,
+            [Globalization.NumberStyles]::Number, [Globalization.CultureInfo]::InvariantCulture, [ref]$balance) -and
+        $balance -ge 0
+    if ($showBalance) {
+        $periodText.Text = '剩余额度'
+        $percentText.Text = [Math]::Round($balance, 0, [MidpointRounding]::AwayFromZero).ToString('N0', [Globalization.CultureInfo]::InvariantCulture)
+    }
+    else {
+        $periodText.Text = $periodLabel
+        $percentText.Text = ('{0:0}%' -f $remainingPercent)
+    }
     $percentText.Foreground = Get-UiBrush '#FF4F5357'
     $resetAt = [DateTimeOffset]::FromUnixTimeSeconds([long]$limitWindow.resetsAt).ToLocalTime()
     $resetToolTipText.Text = if ($resetLabel) {
